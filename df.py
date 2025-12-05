@@ -13,7 +13,7 @@ BATCH_SIZE = 100
 OUTPUT_FILE = "stocks_info.csv"
 
 # ====== DEFAULT GITHUB CONFIG (Edit these) ======
-DEFAULT_GITHUB_TOKEN = "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"  # Your token here: ghp_xxxxx
+DEFAULT_GITHUB_TOKEN = "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"  # Your token here: ghp_xxxxx
 DEFAULT_GITHUB_REPO = "kanishkchawla2/ScatterPlot"   # Your repo: username/repo-name
 DEFAULT_GITHUB_BRANCH = "main"
 # =================================================
