@@ -42,6 +42,37 @@ else:
     github_repo = st.sidebar.text_input("Repository", placeholder="username/repo-name")
     github_branch = st.sidebar.text_input("Branch", value="main")
 
+def verify_github_config(token, repo, branch):
+    """Verify GitHub token and repo access before fetching data"""
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    # Check token validity
+    user_response = requests.get("https://api.github.com/user", headers=headers)
+    if user_response.status_code != 200:
+        return False, "❌ Invalid GitHub token"
+    
+    # Check repo access
+    repo_response = requests.get(f"https://api.github.com/repos/{repo}", headers=headers)
+    if repo_response.status_code == 404:
+        return False, f"❌ Repository '{repo}' not found"
+    elif repo_response.status_code != 200:
+        return False, f"❌ Cannot access repository '{repo}'"
+    
+    # Check write permission by checking if we can get repo contents
+    contents_response = requests.get(f"https://api.github.com/repos/{repo}/contents", headers=headers)
+    if contents_response.status_code not in [200, 404]:  # 404 is ok for empty repo
+        return False, "❌ No write permission to repository"
+    
+    # Check branch exists
+    branch_response = requests.get(f"https://api.github.com/repos/{repo}/branches/{branch}", headers=headers)
+    if branch_response.status_code == 404:
+        return False, f"❌ Branch '{branch}' not found"
+    
+    return True, f"✅ Connected to {repo} ({branch})"
+
 def save_to_github(content, filename, token, repo, branch):
     """Save file to GitHub repo using API"""
     url = f"https://api.github.com/repos/{repo}/contents/{filename}"
@@ -67,7 +98,11 @@ def save_to_github(content, filename, token, repo, branch):
     
     # Push to GitHub
     response = requests.put(url, headers=headers, json=data)
-    return response.status_code in [200, 201]
+    if response.status_code in [200, 201]:
+        return True, "✅ Saved successfully"
+    else:
+        error_msg = response.json().get("message", "Unknown error")
+        return False, f"❌ GitHub API error: {error_msg}"
 
 def get_nse_symbols():
     """Get list of NSE equity symbols"""
@@ -98,7 +133,18 @@ def run_fetcher():
         st.error("⚠️ Please enter GitHub Token and Repository in the sidebar!")
         return
     
+    # Verify GitHub connection FIRST
     status = st.empty()
+    status.info("🔐 Verifying GitHub connection...")
+    
+    valid, message = verify_github_config(github_token, github_repo, github_branch)
+    if not valid:
+        st.error(message)
+        return
+    
+    st.success(message)
+    
+    # Now fetch data
     status.info("Fetching NSE symbols...")
     symbols = get_nse_symbols()
     
@@ -128,13 +174,14 @@ def run_fetcher():
         csv_content = df.to_csv(index=False)
         
         progress_text.text("Saving to GitHub...")
-        if save_to_github(csv_content, OUTPUT_FILE, github_token, github_repo, github_branch):
+        success, message = save_to_github(csv_content, OUTPUT_FILE, github_token, github_repo, github_branch)
+        if success:
             progress_bar.progress(1.0)
             progress_text.text("Done!")
             st.success(f"✅ Saved {len(all_data)} stocks to GitHub: {github_repo}/{OUTPUT_FILE}")
             st.dataframe(df.head(20))
         else:
-            st.error("❌ Failed to save to GitHub. Check your token and repo name.")
+            st.error(message)
     else:
         st.error("No data fetched!")
 
