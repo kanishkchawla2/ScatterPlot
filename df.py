@@ -12,26 +12,35 @@ MAX_RETRIES = 3
 BATCH_SIZE = 100
 OUTPUT_FILE = "stocks_info.csv"
 
+# ====== DEFAULT GITHUB CONFIG (Edit these) ======
+DEFAULT_GITHUB_TOKEN = "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"  # Your token here: ghp_xxxxx
+DEFAULT_GITHUB_REPO = "kanishkchawla2/ScatterPlot"   # Your repo: username/repo-name
+DEFAULT_GITHUB_BRANCH = "main"
+# =================================================
+
 st.set_page_config(page_title="NSE Stock Data Fetcher", layout="wide")
 st.title("📈 NSE Stock Data Fetcher")
 
-# GitHub Setup Instructions
+# GitHub Setup
 st.sidebar.header("⚙️ GitHub Setup")
-st.sidebar.markdown("""
+
+use_default = st.sidebar.checkbox("Use default GitHub config", value=True if DEFAULT_GITHUB_TOKEN else False)
+
+if use_default and DEFAULT_GITHUB_TOKEN:
+    github_token = DEFAULT_GITHUB_TOKEN
+    github_repo = DEFAULT_GITHUB_REPO
+    github_branch = DEFAULT_GITHUB_BRANCH
+    st.sidebar.success(f"Using default: {DEFAULT_GITHUB_REPO}")
+else:
+    st.sidebar.markdown("""
 **To save files to your GitHub repo:**
-
-1. Go to [GitHub Settings → Developer Settings → Personal Access Tokens → Tokens (classic)](https://github.com/settings/tokens)
-2. Click **Generate new token (classic)**
-3. Give it a name like "Streamlit App"
-4. Select scope: **repo** (full control)
-5. Click **Generate token**
-6. Copy the token and paste below
+1. Go to [GitHub Tokens](https://github.com/settings/tokens)
+2. Generate token with **repo** scope
+3. Enter details below
 """)
-
-# GitHub Config
-github_token = st.sidebar.text_input("GitHub Token", type="password")
-github_repo = st.sidebar.text_input("Repository", placeholder="username/repo-name")
-github_branch = st.sidebar.text_input("Branch", value="main")
+    github_token = st.sidebar.text_input("GitHub Token", type="password")
+    github_repo = st.sidebar.text_input("Repository", placeholder="username/repo-name")
+    github_branch = st.sidebar.text_input("Branch", value="main")
 
 def save_to_github(content, filename, token, repo, branch):
     """Save file to GitHub repo using API"""
