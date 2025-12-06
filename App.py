@@ -167,6 +167,47 @@ def load_concall_summaries():
     return None, "No summary file found (Summary.csv / summary.csv / ConcallSummary.csv)."
 
 @st.cache_data
+def load_index_constituents():
+    """
+    Load index constituents from CSV file.
+    Returns a dictionary: { index_name: [list of symbols with .NS suffix] }
+    """
+    candidates = ["index_constituents_long.csv", "nse_all_index_constituents.csv"]
+    for f in candidates:
+        if os.path.exists(f):
+            try:
+                df = pd.read_csv(f)
+                df.columns = [c.strip() for c in df.columns]
+                
+                # Find the symbol and index columns
+                symbol_col = next((c for c in ["Symbol", "symbol", "SYMBOL", "Stock", "stock"] if c in df.columns), None)
+                index_col = next((c for c in ["Index", "index", "INDEX", "IndexName", "index_name"] if c in df.columns), None)
+                
+                if not symbol_col or not index_col:
+                    continue
+                
+                # Build the dictionary
+                index_dict = {}
+                for _, row in df.iterrows():
+                    idx_name = str(row[index_col]).strip()
+                    symbol = str(row[symbol_col]).strip().upper()
+                    
+                    # Add .NS suffix if not present
+                    if not symbol.endswith('.NS'):
+                        symbol = symbol + '.NS'
+                    
+                    if idx_name not in index_dict:
+                        index_dict[idx_name] = []
+                    if symbol not in index_dict[idx_name]:
+                        index_dict[idx_name].append(symbol)
+                
+                return index_dict, None
+            except Exception as e:
+                return None, f"Error reading {f}: {e}"
+    
+    return None, "No index constituents file found (index_constituents_long.csv or nse_all_index_constituents.csv)."
+
+@st.cache_data
 def get_available_industries(df):
     """Get list of available industries"""
     if 'industry' not in df.columns:
@@ -213,6 +254,24 @@ def filter_by_industry(df, industry_filter):
     
     # Filter stocks that contain the industry keyword (case-insensitive)
     filtered_df = df[df['industry'].str.contains(industry_filter, case=False, na=False)]
+    
+    return filtered_df
+
+def filter_by_symbols(df, symbols_list):
+    """
+    Filter stocks by a list of symbols.
+    Returns a DataFrame containing only the stocks in the symbols_list.
+    """
+    # Ensure symbols have .NS suffix for matching
+    symbols_with_ns = []
+    for s in symbols_list:
+        s_upper = s.upper()
+        if not s_upper.endswith('.NS'):
+            s_upper = s_upper + '.NS'
+        symbols_with_ns.append(s_upper)
+    
+    # Filter the dataframe to only include stocks in the list
+    filtered_df = df[df.index.isin(symbols_with_ns)]
     
     return filtered_df
 
@@ -392,7 +451,7 @@ def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outl
     else:
         fig.update_xaxes(range=[filtered_metrics[x_col].min()*x_multiplier*0.95, filtered_metrics[x_col].max()*x_multiplier*1.05])
         fig.update_yaxes(range=[filtered_metrics[y_col].min()*y_multiplier*0.95, filtered_metrics[y_col].max()*y_multiplier*1.05])
-    fig.update_layout(title=f'{industry_filter} Industry: {x_title} vs {y_title}<br><sub>Total Stocks: {len(filtered_metrics)}</sub>', xaxis_title=x_title, yaxis_title=y_title, showlegend=False, width=800, height=600, hovermode='closest')
+    fig.update_layout(title=f'{industry_filter}: {x_title} vs {y_title}<br><sub>Total Stocks: {len(filtered_metrics)}</sub>', xaxis_title=x_title, yaxis_title=y_title, showlegend=False, width=800, height=600, hovermode='closest')
     if debug:
         fig.add_annotation(xref='paper', yref='paper', x=0, y=1.18, showarrow=False, text=f"DEBUG pts={len(filtered_metrics)}")
     if len(fig.data)==0:
@@ -400,17 +459,96 @@ def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outl
     return fig, filtered_metrics
 
 
+def render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode=False, use_gl=True):
+    """
+    Render scatter charts using the existing plotting pipeline.
+    This is a helper function to avoid code duplication across modes.
+    """
+    num_charts = len(chart_configs)
+    
+    if filtered_df is None or len(filtered_df) == 0:
+        st.warning(f"No stocks found for {title_prefix}.")
+        return
+    
+    # Layout based on number of charts
+    if num_charts == 1:
+        cols = [st.container()]
+    elif num_charts == 2:
+        cols = st.columns(2)
+    elif num_charts == 3:
+        cols = st.columns([1, 1, 1])
+    else:
+        col1, col2 = st.columns(2)
+        cols = [col1, col2, col1, col2]
+    
+    all_final_metrics = []
+    
+    for i, cfg in enumerate(chart_configs):
+        x_col = cfg['x_col']
+        y_col = cfg['y_col']
+        chart_num = cfg['chart_num']
+        
+        metrics_df, message = extract_metrics(filtered_df, x_col, y_col)
+        
+        if metrics_df is None:
+            with cols[i % len(cols)]:
+                st.error(f"Chart {chart_num} - Error extracting metrics: {message}")
+            continue
+        
+        fig, final_metrics = create_plotly_scatter(
+            metrics_df, title_prefix, x_col, y_col,
+            remove_outliers, highlight_stock, autoscale=True,
+            use_gl=use_gl, debug=debug_mode
+        )
+        
+        if fig is None:
+            with cols[i % len(cols)]:
+                st.warning(f"Chart {chart_num} - No data available after filtering.")
+            continue
+        
+        with cols[i % len(cols)]:
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"📊 Chart {chart_num}: {message}")
+            
+            if highlight_stock and highlight_stock in final_metrics.index:
+                sd = final_metrics.loc[highlight_stock]
+                xv = sd[x_col] if pd.notna(sd[x_col]) else "N/A"
+                yv = sd[y_col] if pd.notna(sd[y_col]) else "N/A"
+                st.info(f"🎯 **{highlight_stock.replace('.NS', '')}**: {x_col}={xv}, {y_col}={yv}")
+            
+            all_final_metrics.append(final_metrics)
+    
+    # Download options
+    if all_final_metrics:
+        st.markdown("---")
+        st.subheader("📥 Download Options")
+        download_cols = st.columns(min(len(all_final_metrics), 4))
+        
+        for i, (fm, cfg) in enumerate(zip(all_final_metrics, chart_configs)):
+            with download_cols[i % len(download_cols)]:
+                dl = fm.copy()
+                dl.index.name = 'Stock_Symbol'
+                dl = dl.reset_index()
+                csv = dl.to_csv(index=False)
+                safe_title = title_prefix.replace(' ', '_').replace('/', '_')
+                st.download_button(
+                    label=f"📥 Chart {cfg['chart_num']} Data",
+                    data=csv,
+                    file_name=f"{safe_title}_{cfg['x_col']}_vs_{cfg['y_col']}_analysis.csv",
+                    mime="text/csv",
+                    key=f"download_{i}"
+                )
+        
+        st.info("💡 **Tip**: Hover over points in the charts for detailed information!")
+
 
 def main():
-    """Main Streamlit app with URL parameter handling"""
+    """Main Streamlit app with URL parameter handling and Mode Selector"""
     
     # Handle URL parameters first
     navigation_info = handle_url_parameters()
-    mode = navigation_info.get('mode')  # 'scatter', 'concall', or None
+    url_mode = navigation_info.get('mode')  # 'scatter', 'concall', or None
     
-    # Header
-    
-   
     # Load data
     with st.spinner("Loading stock data..."):
         df, error = load_and_process_data()
@@ -420,10 +558,12 @@ def main():
         st.info("Make sure 'stocks_info.csv' exists in the current directory.")
         return
     
+    # Load index constituents
+    index_dict, index_error = load_index_constituents()
+    
     # Show data info
     num_stocks = len(df)
     num_metrics = len([col for col in df.columns if col not in ['industry', 'longName', 'shortName']])
-    
     
     # Handle navigation from URL parameters
     nav_mode, nav_stock, nav_industry = display_navigation_banner(navigation_info, df)
@@ -435,9 +575,6 @@ def main():
         st.error("No numeric columns found in the dataset.")
         return
     
-    # Sidebar
-    st.sidebar.header("⚙️ Analysis Settings")
-    
     # Get available industries
     industries = get_available_industries(df)
     
@@ -445,62 +582,154 @@ def main():
         st.error("No industry data found in the dataset.")
         return
     
-    # Always use "By Stock" mode
-    selection_mode = "By Stock"
+    # ==================== MODE SELECTOR ====================
+    st.sidebar.header("🔄 Analysis Mode")
     
-    # Industry selection is determined by the selected stock
-    industry_index = 0
-    
-    # Industry selection is determined by the selected stock (hidden from user)
-    # selected_industry will be set after stock selection
-    
-    # Stock selection - use URL parameter if available
-    available_stocks = sorted([stock.replace('.NS', '') for stock in df.index if pd.notna(df.loc[stock, 'industry'])])
-    
-    if not available_stocks:
-        st.error("No stocks with industry data found.")
-        return
-    
-    if nav_stock:
-        nav_stock_clean = nav_stock.replace('.NS', '')
-        try:
-            stock_index = available_stocks.index(nav_stock_clean)
-        except ValueError:
-            stock_index = 0
-    else:
-        stock_index = 0
-    
-    selected_stock_clean = st.sidebar.selectbox(
-        "📈 Select Stock:",
-        available_stocks,
-        index=stock_index,
-        help="Choose a stock to analyze its industry"
+    analysis_mode = st.sidebar.radio(
+        "Select Mode:",
+        ["Stock Mode", "Sector Mode", "Index Mode"],
+        index=0,
+        help="Choose how to select stocks for analysis"
     )
     
-    if selected_stock_clean:
-        selected_stock = f"{selected_stock_clean}.NS"
-        # Get the industry of the selected stock
-        if selected_stock in df.index:
-            selected_industry = df.loc[selected_stock, 'industry']
-            st.sidebar.success(f"🎯 **{selected_stock_clean}** belongs to **{selected_industry}** industry")
-        else:
-            st.sidebar.error(f"Stock {selected_stock_clean} not found in data")
-            return
+    st.sidebar.markdown("---")
     
-    # Chart configuration
+    # Variables to hold selection results
+    selected_stock = None
+    selected_industry = None
+    selected_index = None
+    filtered_df = None
+    title_prefix = ""
+    highlight_stock = None
+    
+    # ==================== STOCK MODE ====================
+    if analysis_mode == "Stock Mode":
+        st.sidebar.header("📈 Stock Selection")
+        
+        # Get available stocks
+        available_stocks = sorted([stock.replace('.NS', '') for stock in df.index if pd.notna(df.loc[stock, 'industry'])])
+        
+        if not available_stocks:
+            st.error("No stocks with industry data found.")
+            return
+        
+        # Use URL parameter if available
+        if nav_stock:
+            nav_stock_clean = nav_stock.replace('.NS', '')
+            try:
+                stock_index = available_stocks.index(nav_stock_clean)
+            except ValueError:
+                stock_index = 0
+        else:
+            stock_index = 0
+        
+        selected_stock_clean = st.sidebar.selectbox(
+            "📈 Select Stock:",
+            available_stocks,
+            index=stock_index,
+            help="Choose a stock to analyze its industry"
+        )
+        
+        if selected_stock_clean:
+            selected_stock = f"{selected_stock_clean}.NS"
+            
+            if selected_stock in df.index:
+                selected_industry = df.loc[selected_stock, 'industry']
+                st.sidebar.success(f"🎯 **{selected_stock_clean}** belongs to **{selected_industry}** industry")
+                
+                # Filter by the stock's industry
+                filtered_df = filter_by_industry(df, selected_industry)
+                title_prefix = f"{selected_industry} Industry"
+                highlight_stock = selected_stock
+            else:
+                st.sidebar.error(f"Stock {selected_stock_clean} not found in data")
+                return
+    
+    # ==================== SECTOR MODE ====================
+    elif analysis_mode == "Sector Mode":
+        st.sidebar.header("🏭 Sector Selection")
+        
+        # Use URL parameter if available
+        if nav_industry:
+            try:
+                industry_index = industries.index(nav_industry)
+            except ValueError:
+                industry_index = 0
+        else:
+            industry_index = 0
+        
+        selected_industry = st.sidebar.selectbox(
+            "🏭 Select Sector/Industry:",
+            industries,
+            index=industry_index,
+            help="Choose a sector to view all stocks in that sector"
+        )
+        
+        if selected_industry:
+            filtered_df = filter_by_industry(df, selected_industry)
+            title_prefix = f"{selected_industry} Sector"
+            highlight_stock = None  # No specific stock highlighted in sector mode
+            
+            if filtered_df is not None:
+                st.sidebar.success(f"📊 **{len(filtered_df)}** stocks in **{selected_industry}**")
+    
+    # ==================== INDEX MODE ====================
+    elif analysis_mode == "Index Mode":
+        st.sidebar.header("📑 Index Selection")
+        
+        if index_dict is None:
+            st.sidebar.error(f"Could not load index data: {index_error}")
+            st.error("Index constituents file not found. Please ensure 'index_constituents_long.csv' exists.")
+            return
+        
+        # Get available indices
+        available_indices = sorted(index_dict.keys())
+        
+        if not available_indices:
+            st.sidebar.error("No indices found in the constituents file.")
+            return
+        
+        selected_index = st.sidebar.selectbox(
+            "📑 Select Index:",
+            available_indices,
+            index=0,
+            help="Choose an index to view all constituent stocks"
+        )
+        
+        if selected_index:
+            index_symbols = index_dict[selected_index]
+            
+            # Filter df to only include stocks in the index
+            filtered_df = filter_by_symbols(df, index_symbols)
+            title_prefix = f"{selected_index} Index"
+            highlight_stock = None  # No specific stock highlighted in index mode
+            
+            # Show stats
+            matched_count = len(filtered_df)
+            total_in_index = len(index_symbols)
+            st.sidebar.success(f"📊 **{matched_count}** of **{total_in_index}** stocks found in data")
+            
+            if matched_count < total_in_index:
+                missing_count = total_in_index - matched_count
+                st.sidebar.warning(f"⚠️ {missing_count} stocks not in stocks_info.csv")
+    
+    # ==================== CHART CONFIGURATION ====================
     st.sidebar.markdown("---")
     st.sidebar.subheader("📊 Chart Configuration")
+    
     debug_mode = False
     use_gl = True
+    
     # Only build chart configuration if charts will be shown
-    if mode != 'concall':
+    if url_mode != 'concall':
         num_charts = st.sidebar.slider(
             "📈 Number of Charts:",
             min_value=1,
-            max_value=4,
-            value=1,
+            max_value=5,
+            value=4,
             help="Choose how many charts to display"
         )
+        
         # Store chart configurations
         chart_configs = []
         
@@ -508,9 +737,9 @@ def main():
             st.sidebar.markdown(f"#### Chart {i+1}")
             
             # Default values for each chart
-            defaults_x = ['trailingPE', 'priceToBook', 'earningsGrowth', 'currentRatio']
-            defaults_y = ['earningsGrowth', 'revenueGrowth', 'dividendYield', 'debtToEquity']
-            
+            defaults_x = ['trailingPE', 'trailingPE', 'profitMargins', 'debtToEquity']
+            defaults_y = ['earningsGrowth', 'revenueGrowth', 'operatingMargins', 'profitMargins']
+
             default_x = defaults_x[i] if i < len(defaults_x) and defaults_x[i] in numeric_columns else numeric_columns[0]
             default_y = defaults_y[i] if i < len(defaults_y) and defaults_y[i] in numeric_columns else (
                 numeric_columns[1] if len(numeric_columns) > 1 else numeric_columns[0]
@@ -540,8 +769,8 @@ def main():
         
         # Additional filters
         remove_outliers = st.sidebar.checkbox(
-            "🎯 Remove Outliers", 
-            value=True, 
+            "🎯 Remove Outliers",
+            value=True,
             help="Remove extreme values for better visualization"
         )
     else:
@@ -549,170 +778,130 @@ def main():
         chart_configs = []
         remove_outliers = True
     
-    # Industry info
-    if selected_industry:
-        industry_count = len(df[df['industry'].str.contains(selected_industry, case=False, na=False)])
-        st.sidebar.info(f"📈 **{industry_count}** stocks found in **{selected_industry}** industry")
-    
-    # Rendering logic based on mode
-    if mode == 'scatter':
+    # # ==================== STATUS DISPLAY ====================
+    # if filtered_df is not None and len(filtered_df) > 0:
+    #     status_text = f"📊 **{analysis_mode}**: Plotting **{len(filtered_df)}** stocks"
+    #     if analysis_mode == "Stock Mode" and selected_industry:
+    #         status_text += f" from **{selected_industry}** industry"
+    #     elif analysis_mode == "Sector Mode" and selected_industry:
+    #         status_text += f" in **{selected_industry}** sector"
+    #     elif analysis_mode == "Index Mode" and selected_index:
+    #         status_text += f" from **{selected_index}** index"
         
-        # ...existing chart rendering block (reuse filtered_df logic)...
-        if selected_industry:
-            filtered_df = filter_by_industry(df, selected_industry)
-            if filtered_df is None or len(filtered_df) == 0:
-                st.warning(f"No stocks found for {selected_industry} industry.")
-            else:
-                highlight_stock = selected_stock
-                if num_charts == 1:
-                    cols = [st.container()]
-                elif num_charts == 2:
-                    cols = st.columns(2)
-                elif num_charts == 3:
-                    cols = st.columns([1,1,1])
-                else:
-                    col1, col2 = st.columns(2); cols = [col1, col2, col1, col2]
-                all_final_metrics = []
-                for i, cfg in enumerate(chart_configs):
-                    x_col = cfg['x_col']; y_col = cfg['y_col']; chart_num = cfg['chart_num']
-                    metrics_df, message = extract_metrics(filtered_df, x_col, y_col)
-                    if metrics_df is None:
-                        with cols[i % len(cols)]: st.error(f"Chart {chart_num} - Error extracting metrics: {message}"); continue
-                    fig, final_metrics = create_plotly_scatter(metrics_df, selected_industry, x_col, y_col, remove_outliers, highlight_stock, autoscale=True, use_gl=use_gl, debug=debug_mode)
-                    if fig is None:
-                        with cols[i % len(cols)]: st.warning(f"Chart {chart_num} - No data available after filtering."); continue
-                    with cols[i % len(cols)]:
-                        st.plotly_chart(fig, use_container_width=True)
-                        st.caption(f"📊 Chart {chart_num}: {message}")
-                        if selected_stock and selected_stock in final_metrics.index:
-                            sd = final_metrics.loc[selected_stock]; xv = sd[x_col] if pd.notna(sd[x_col]) else "N/A"; yv = sd[y_col] if pd.notna(sd[y_col]) else "N/A"
-                            st.info(f"🎯 **{selected_stock.replace('.NS','')}**: {x_col}={xv}, {y_col}={yv}")
-                        all_final_metrics.append(final_metrics)
-                if all_final_metrics:
-                    st.markdown("---"); st.subheader("📥 Download Options")
-                    download_cols = st.columns(min(len(all_final_metrics), 4))
-                    for i, (fm, cfg) in enumerate(zip(all_final_metrics, chart_configs)):
-                        with download_cols[i % len(download_cols)]:
-                            dl = fm.copy(); dl.index.name = 'Stock_Symbol'; dl = dl.reset_index(); csv = dl.to_csv(index=False)
-                            st.download_button(label=f"📥 Chart {cfg['chart_num']} Data", data=csv, file_name=f"{selected_industry}_{cfg['x_col']}_vs_{cfg['y_col']}_analysis.csv", mime="text/csv", key=f"download_{i}")
-                    st.info("💡 **Tip**: Hover over points in the charts for detailed information!")
+    #     st.markdown(status_text)
+    #     st.markdown("---")
+    
+    # ==================== RENDERING LOGIC ====================
+    if url_mode == 'scatter':
+        # Direct scatter mode from URL
+        if filtered_df is not None and len(filtered_df) > 0:
+            render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl)
         else:
-            st.warning("Please select an industry to view charts.")
-    elif mode == 'concall':
+            st.warning("Please select a stock, sector, or index to view charts.")
+    
+    elif url_mode == 'concall':
+        # Direct concall mode from URL
         st.subheader("🗣️ Concall / Summary Viewer")
         summaries_df, summaries_error = load_concall_summaries()
+        
         if summaries_df is None:
             st.warning(summaries_error)
         else:
-            symbol_col = next((c for c in ["Stock","Symbol","Ticker"] if c in summaries_df.columns), None)
-            summary_col = next((c for c in ["Summary","Concall","ConcallSummary","Notes"] if c in summaries_df.columns), None)
+            symbol_col = next((c for c in ["Stock", "Symbol", "Ticker"] if c in summaries_df.columns), None)
+            summary_col = next((c for c in ["Summary", "Concall", "ConcallSummary", "Notes"] if c in summaries_df.columns), None)
             stock_symbols = sorted(summaries_df[symbol_col].unique())
-            display_symbols = [s.replace('.NS','') for s in stock_symbols]
+            display_symbols = [s.replace('.NS', '') for s in stock_symbols]
+            
             default_idx = 0
-            if 'type' in navigation_info and navigation_info['type']=='stock' and navigation_info['value'] in stock_symbols:
+            if 'type' in navigation_info and navigation_info['type'] == 'stock' and navigation_info['value'] in stock_symbols:
                 default_idx = stock_symbols.index(navigation_info['value'])
+            
             chosen_display = st.selectbox("Select Stock:", display_symbols, index=default_idx)
             chosen_symbol = chosen_display + '.NS'
             row = summaries_df[summaries_df[symbol_col] == chosen_symbol]
+            
             if row.empty:
                 st.info("No summary available for this stock.")
             else:
-                r = row.iloc[0]; st.markdown(f"### {chosen_display}")
+                r = row.iloc[0]
+                st.markdown(f"### {chosen_display}")
+                
                 if summary_col and pd.notna(r.get(summary_col)):
                     st.markdown(r.get(summary_col))
                 else:
                     for c in summaries_df.columns:
                         if c != symbol_col and pd.notna(r.get(c)):
                             st.markdown(f"**{c}**: {r.get(c)}")
+                
                 with st.expander("🔍 Search across summaries"):
                     q = st.text_input("Keyword")
                     if q:
-                        hits = summaries_df[summaries_df.apply(lambda rw: any(q.lower() in str(rw[col]).lower() for col in summaries_df.columns if col != symbol_col), axis=1)]
+                        hits = summaries_df[summaries_df.apply(
+                            lambda rw: any(q.lower() in str(rw[col]).lower() for col in summaries_df.columns if col != symbol_col),
+                            axis=1
+                        )]
                         if hits.empty:
                             st.info("No matches.")
                         else:
                             cols_to_show = [symbol_col] + ([summary_col] if summary_col else [])
                             st.dataframe(hits[cols_to_show])
+    
     else:
-        # Default: show both tabs as before
+        # Default: show both tabs
         charts_tab, concall_tab = st.tabs(["📊 Charts", "🗣️ Concall Summaries"])
+        
         with charts_tab:
-            # Reuse scatter rendering when mode not specified
-            if selected_industry:
-                filtered_df = filter_by_industry(df, selected_industry)
-                if filtered_df is None or len(filtered_df) == 0:
-                    st.warning(f"No stocks found for {selected_industry} industry.")
-                else:
-                    highlight_stock = selected_stock
-                    if num_charts == 1:
-                        cols = [st.container()]
-                    elif num_charts == 2:
-                        cols = st.columns(2)
-                    elif num_charts == 3:
-                        cols = st.columns([1,1,1])
-                    else:
-                        col1, col2 = st.columns(2); cols = [col1, col2, col1, col2]
-                    all_final_metrics = []
-                    for i, cfg in enumerate(chart_configs):
-                        x_col = cfg['x_col']; y_col = cfg['y_col']; chart_num = cfg['chart_num']
-                        metrics_df, message = extract_metrics(filtered_df, x_col, y_col)
-                        if metrics_df is None:
-                            with cols[i % len(cols)]: st.error(f"Chart {chart_num} - Error extracting metrics: {message}"); continue
-                        fig, final_metrics = create_plotly_scatter(metrics_df, selected_industry, x_col, y_col, remove_outliers, highlight_stock, autoscale=True, use_gl=use_gl, debug=debug_mode)
-                        if fig is None:
-                            with cols[i % len(cols)]: st.warning(f"Chart {chart_num} - No data available after filtering."); continue
-                        with cols[i % len(cols)]:
-                            st.plotly_chart(fig, use_container_width=True)
-                            st.caption(f"📊 Chart {chart_num}: {message}")
-                            if selected_stock and selected_stock in final_metrics.index:
-                                sd = final_metrics.loc[selected_stock]; xv = sd[x_col] if pd.notna(sd[x_col]) else "N/A"; yv = sd[y_col] if pd.notna(sd[y_col]) else "N/A"
-                                st.info(f"🎯 **{selected_stock.replace('.NS','')}**: {x_col}={xv}, {y_col}={yv}")
-                            all_final_metrics.append(final_metrics)
-                    if all_final_metrics:
-                        st.markdown("---"); st.subheader("📥 Download Options")
-                        download_cols = st.columns(min(len(all_final_metrics), 4))
-                        for i, (fm, cfg) in enumerate(zip(all_final_metrics, chart_configs)):
-                            with download_cols[i % len(download_cols)]:
-                                dl = fm.copy(); dl.index.name = 'Stock_Symbol'; dl = dl.reset_index(); csv = dl.to_csv(index=False)
-                                st.download_button(label=f"📥 Chart {cfg['chart_num']} Data", data=csv, file_name=f"{selected_industry}_{cfg['x_col']}_vs_{cfg['y_col']}_analysis.csv", mime="text/csv", key=f"download_{i}")
-                        st.info("💡 **Tip**: Hover over points in the charts for detailed information!")
+            if filtered_df is not None and len(filtered_df) > 0:
+                render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl)
             else:
-                st.warning("Please select an industry to view charts.")
+                st.warning("Please select a stock, sector, or index to view charts.")
+        
         with concall_tab:
             st.subheader("🗣️ Concall / Summary Viewer")
             summaries_df, summaries_error = load_concall_summaries()
+            
             if summaries_df is None:
                 st.warning(summaries_error)
             else:
-                symbol_col = next((c for c in ["Stock","Symbol","Ticker"] if c in summaries_df.columns), None)
-                summary_col = next((c for c in ["Summary","Concall","ConcallSummary","Notes"] if c in summaries_df.columns), None)
+                symbol_col = next((c for c in ["Stock", "Symbol", "Ticker"] if c in summaries_df.columns), None)
+                summary_col = next((c for c in ["Summary", "Concall", "ConcallSummary", "Notes"] if c in summaries_df.columns), None)
                 stock_symbols = sorted(summaries_df[symbol_col].unique())
-                display_symbols = [s.replace('.NS','') for s in stock_symbols]
+                display_symbols = [s.replace('.NS', '') for s in stock_symbols]
+                
                 default_idx = 0
-                if 'type' in navigation_info and navigation_info['type']=='stock' and navigation_info['value'] in stock_symbols:
+                if 'type' in navigation_info and navigation_info['type'] == 'stock' and navigation_info['value'] in stock_symbols:
                     default_idx = stock_symbols.index(navigation_info['value'])
-                chosen_display = st.selectbox("Select Stock:", display_symbols, index=default_idx)
+                
+                chosen_display = st.selectbox("Select Stock:", display_symbols, index=default_idx, key="concall_stock_selector")
                 chosen_symbol = chosen_display + '.NS'
                 row = summaries_df[summaries_df[symbol_col] == chosen_symbol]
+                
                 if row.empty:
                     st.info("No summary available for this stock.")
                 else:
-                    r = row.iloc[0]; st.markdown(f"### {chosen_display}")
+                    r = row.iloc[0]
+                    st.markdown(f"### {chosen_display}")
+                    
                     if summary_col and pd.notna(r.get(summary_col)):
                         st.markdown(r.get(summary_col))
                     else:
                         for c in summaries_df.columns:
                             if c != symbol_col and pd.notna(r.get(c)):
                                 st.markdown(f"**{c}**: {r.get(c)}")
+                    
                     with st.expander("🔍 Search across summaries"):
-                        q = st.text_input("Keyword")
+                        q = st.text_input("Keyword", key="concall_search")
                         if q:
-                            hits = summaries_df[summaries_df.apply(lambda rw: any(q.lower() in str(rw[col]).lower() for col in summaries_df.columns if col != symbol_col), axis=1)]
+                            hits = summaries_df[summaries_df.apply(
+                                lambda rw: any(q.lower() in str(rw[col]).lower() for col in summaries_df.columns if col != symbol_col),
+                                axis=1
+                            )]
                             if hits.empty:
                                 st.info("No matches.")
                             else:
                                 cols_to_show = [symbol_col] + ([summary_col] if summary_col else [])
                                 st.dataframe(hits[cols_to_show])
+
 
 if __name__ == "__main__":
     main()
