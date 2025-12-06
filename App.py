@@ -15,6 +15,7 @@ st.set_page_config(
 st.markdown("""
 <style>
 .main { padding-top: 1rem; }
+.stMainMenu { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
