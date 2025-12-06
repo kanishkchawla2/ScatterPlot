@@ -33,7 +33,7 @@ st.markdown("""
 # DEFAULT API KEYS - Add your Gemini API keys here for rotation
 # =============================================================================
 DEFAULT_API_KEYS = [
-    "AIzaSyDTlvBVoi_22xGbaT9hLYKeiYwWRu0qEnY",  # Replace with your actual API key
+   ""  # Replace with your actual API key
     # Add more keys for rotation (optional)
     # "YOUR_GEMINI_API_KEY_3",  # Uncomment and add more as needed
 ]
