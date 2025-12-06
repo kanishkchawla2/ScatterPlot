@@ -3,6 +3,16 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import os
+import re
+import json
+import time
+
+# Try to import google.generativeai for AI comps (optional)
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
 
 # Set page configuration
 st.set_page_config(
@@ -18,6 +28,281 @@ st.markdown("""
 .stMainMenu { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
+# =============================================================================
+# DEFAULT API KEYS - Add your Gemini API keys here for rotation
+# =============================================================================
+DEFAULT_API_KEYS = [
+    "AIzaSyDTlvBVoi_22xGbaT9hLYKeiYwWRu0qEnY",  # Replace with your actual API key
+    # Add more keys for rotation (optional)
+    # "YOUR_GEMINI_API_KEY_3",  # Uncomment and add more as needed
+]
+# =============================================================================
+
+# --- AI Comps Session State Initialization ---
+if 'ai_comps_api_keys' not in st.session_state:
+    st.session_state.ai_comps_api_keys = [k for k in DEFAULT_API_KEYS if k and not k.startswith("YOUR_")]
+if 'ai_comps_results_df' not in st.session_state:
+    st.session_state.ai_comps_results_df = None
+if 'ai_comps_similarity_threshold' not in st.session_state:
+    st.session_state.ai_comps_similarity_threshold = 50
+if 'ai_comps_current_key_index' not in st.session_state:
+    st.session_state.ai_comps_current_key_index = 0
+if 'ai_comps_plot_mode' not in st.session_state:
+    st.session_state.ai_comps_plot_mode = "Highlight Mode"  # "Highlight Mode" or "Filter Mode"
+
+# --- AI Comps Helper Functions ---
+def ai_comps_normalize_symbol(s):
+    """Normalize symbol to uppercase with .NS suffix for matching."""
+    s = str(s).strip().upper()
+    return s if s.endswith('.NS') else s + '.NS'
+
+def ai_comps_clean_relevance_score(score):
+    """Safely converts the relevance score to a float between 0 and 100."""
+    if pd.isna(score): return 0.00
+    if isinstance(score, (int, float)): return float(score)
+    if isinstance(score, str):
+        cleaned = re.sub(r'[^\d.]', '', str(score))
+        try:
+            return float(cleaned) if cleaned else 0.00
+        except ValueError:
+            return 0.00
+    return 0.00
+
+def ai_comps_get_similarity_map():
+    """Build similarity map from AI comps results if available."""
+    if st.session_state.ai_comps_results_df is None:
+        return {}
+    
+    results_df = st.session_state.ai_comps_results_df
+    
+    # Find the relevance score column (case-insensitive)
+    score_col = None
+    for col in results_df.columns:
+        if col.lower().replace(' ', '_') in ['relevance_score', 'relevancescore', 'relevance score']:
+            score_col = col
+            break
+    
+    if score_col is None:
+        return {}
+    
+    # Find the company name column
+    name_col = None
+    for col in results_df.columns:
+        if col.lower().replace(' ', '_') in ['company_name', 'companyname', 'company name', 'symbol']:
+            name_col = col
+            break
+    
+    if name_col is None:
+        return {}
+    
+    similarity_map = {}
+    for _, row in results_df.iterrows():
+        symbol = ai_comps_normalize_symbol(row[name_col])
+        score = ai_comps_clean_relevance_score(row[score_col])
+        similarity_map[symbol] = score
+        # Also add without .NS for flexible matching
+        symbol_short = symbol.replace('.NS', '')
+        similarity_map[symbol_short] = score
+    
+    return similarity_map
+
+def ai_comps_load_gemini_model(api_key):
+    """Loads and validates the Gemini model with the given API key."""
+    if not GENAI_AVAILABLE:
+        raise Exception("google-generativeai package not installed. Run: pip install google-generativeai")
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        # Simple test to validate the key and model
+        test_response = model.generate_content("Say OK")
+        if "OK" not in test_response.text:
+            raise RuntimeError("Gemini model did not respond as expected.")
+        return model
+    except Exception as e:
+        raise Exception(f"Failed to initialize Gemini model. Check your API Key. Error: {e}")
+
+def ai_comps_process_batch(batch_df, target_bd, model, target_company_name):
+    """Processes a single batch of companies by sending them to the AI."""
+    companies_data = []
+    for _, row in batch_df.iterrows():
+        comp_name = row.name if isinstance(row.name, str) else str(row.get("Company Name", row.name))
+        comp_name = comp_name.replace('.NS', '')
+        comp_bd = row.get("longName", "") or row.get("shortName", "") or "No business description available"
+        companies_data.append({"name": str(comp_name), "description": str(comp_bd)})
+
+    prompt = f"""
+You are a financial analyst specializing in competitive intelligence. Your task is to analyze a list of companies and compare them to a primary target company based on their business descriptions.
+
+**TARGET COMPANY'S NAME:** {target_company_name}
+**TARGET COMPANY'S BUSINESS DESCRIPTION:**
+{target_bd}
+
+**COMPANIES TO ANALYZE (PEERS IN THE SAME INDUSTRY):**
+{chr(10).join([f"{i + 1}. {comp['name']}: {comp['description']}" for i, comp in enumerate(companies_data)])}
+
+For each company in the list, provide the following analysis:
+
+1.  **Business Summary**: A concise 1-2 sentence summary of what the company does.
+2.  **Business Model**: How the company primarily generates revenue (e.g., B2B, B2C, SaaS, advertising).
+3.  **Key Products/Services**: The main products or services offered.
+4.  **Relevance Score**: A numerical score from 1.00 to 100.00 indicating how similar the company's business is to the target company. A higher score means a more direct competitor. If the company being analyzed is the target company itself ({target_company_name}), its score MUST be 100.00.
+5.  **Relevance Reason**: A brief 1-2 sentence explanation for the given relevance score.
+
+**Required Response Format (Strict JSON):**
+```json
+{{
+  "companies": [
+    {{
+      "company_name": "Company Name",
+      "business_summary": "Clear summary of what they do.",
+      "business_model": "How they make money.",
+      "key_products_services": "Main products/services.",
+      "relevance_score": 85.50,
+      "relevance_reason": "Reason for the score, comparing to the target."
+    }}
+  ]
+}}
+```
+
+IMPORTANT:
+- The `relevance_score` MUST be a numeric value (like 85.50).
+- The JSON response MUST be perfectly formatted.
+- It is MANDATORY to return a JSON object for every single company provided in the input list.
+"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            full_response = response.text.strip()
+
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', full_response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                json_start = full_response.find('{')
+                json_end = full_response.rfind('}') + 1
+                if json_start == -1 or json_end == 0: raise ValueError("No JSON found in response")
+                json_str = full_response[json_start:json_end]
+
+            parsed_data = json.loads(json_str)
+            companies_analysis = parsed_data.get('companies', [])
+
+            batch_results = []
+            for i, comp_data in enumerate(companies_data):
+                original_row = batch_df.iloc[i]
+                analysis = next((item for item in companies_analysis if
+                                 item.get("company_name", "").lower() == comp_data["name"].lower()), {})
+
+                result_entry = {
+                    "Company Name": comp_data["name"],
+                    "Industry": original_row.get("industry", "N/A"),
+                    "Business Summary": analysis.get("business_summary", "N/A"),
+                    "Business Model": analysis.get("business_model", "N/A"),
+                    "Key Products/Services": analysis.get("key_products_services", "N/A"),
+                    "Relevance Score": analysis.get("relevance_score", 0.00),
+                    "Relevance Reason": analysis.get("relevance_reason", "AI did not return data for this company.")
+                }
+                batch_results.append(result_entry)
+            return batch_results, None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                error_results = [{
+                    "Company Name": comp["name"], "Industry": batch_df.iloc[i].get("industry", "N/A"),
+                    "Business Summary": "Processing failed", "Business Model": "Error",
+                    "Key Products/Services": "Error", "Relevance Score": 0.00,
+                    "Relevance Reason": f"API/Parsing Error: {str(e)}"
+                } for i, comp in enumerate(companies_data)]
+                return error_results, f"A batch failed after {max_retries} attempts. Error: {e}"
+
+def ai_comps_run_analysis(df_to_process, target_bd, target_company_name, batch_size=5):
+    """Runs AI comps analysis on the given dataframe with automatic key rotation."""
+    api_keys = st.session_state.ai_comps_api_keys
+    
+    if not api_keys:
+        st.error("Cannot start analysis: No API keys available. Add keys to DEFAULT_API_KEYS in code or sidebar.")
+        return None
+    
+    progress_bar = st.progress(0, "Initializing AI analysis...")
+    
+    # Start from the current key index for rotation
+    current_key_idx = st.session_state.ai_comps_current_key_index % len(api_keys)
+    model = None
+    key_attempts = 0
+    
+    # Try to initialize model with key rotation
+    while key_attempts < len(api_keys):
+        try:
+            api_key = api_keys[current_key_idx]
+            model = ai_comps_load_gemini_model(api_key)
+            st.session_state.ai_comps_current_key_index = current_key_idx
+            break
+        except Exception as e:
+            st.warning(f"Key {current_key_idx + 1} failed, trying next key...")
+            current_key_idx = (current_key_idx + 1) % len(api_keys)
+            key_attempts += 1
+    
+    if model is None:
+        st.error("❌ All API keys failed. Please check your API keys.")
+        progress_bar.empty()
+        return None
+    
+    total_batches = (len(df_to_process) + batch_size - 1) // batch_size
+    all_results = []
+    
+    for i in range(total_batches):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, len(df_to_process))
+        batch_df = df_to_process.iloc[start_idx:end_idx]
+        
+        progress_bar.progress((i + 1) / total_batches, f"Processing Batch {i + 1}/{total_batches}...")
+        
+        # Try processing with key rotation on failure
+        batch_results = None
+        batch_key_attempts = 0
+        
+        while batch_key_attempts < len(api_keys):
+            try:
+                batch_results, error = ai_comps_process_batch(batch_df, target_bd, model, target_company_name)
+                if error and "quota" in str(error).lower():
+                    raise Exception("Quota exceeded")
+                break
+            except Exception as e:
+                if "quota" in str(e).lower() or "rate" in str(e).lower():
+                    # Rotate to next key
+                    current_key_idx = (current_key_idx + 1) % len(api_keys)
+                    st.session_state.ai_comps_current_key_index = current_key_idx
+                    try:
+                        model = ai_comps_load_gemini_model(api_keys[current_key_idx])
+                        batch_key_attempts += 1
+                        continue
+                    except:
+                        batch_key_attempts += 1
+                        continue
+                else:
+                    batch_results, error = ai_comps_process_batch(batch_df, target_bd, model, target_company_name)
+                    break
+        
+        if batch_results:
+            all_results.extend(batch_results)
+        
+        if i < total_batches - 1:
+            time.sleep(1)
+    
+    # Rotate key for next run
+    st.session_state.ai_comps_current_key_index = (current_key_idx + 1) % len(api_keys)
+    
+    final_df = pd.DataFrame(all_results)
+    final_df['Relevance Score'] = final_df['Relevance Score'].apply(ai_comps_clean_relevance_score).clip(0, 100)
+    final_df = final_df.sort_values(by='Relevance Score', ascending=False)
+    
+    progress_bar.empty()
+    st.success(f"✅ AI Analysis Complete! Processed {len(final_df)} companies.")
+    
+    return final_df
 
 def handle_url_parameters():
     """Handle URL parameters for Excel integration"""
@@ -313,7 +598,7 @@ def extract_metrics(df, x_col, y_col):
     
     return metrics_df, f"Processed {final_count} stocks (removed {initial_count - final_count} with missing data)"
 
-def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outliers=True, highlight_stock=None, autoscale=False, use_gl=True, debug=False):
+def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outliers=True, highlight_stock=None, autoscale=False, use_gl=True, debug=False, similarity_threshold=None, similarity_map=None):
     """Create an interactive scatter plot using Plotly (robust fallback sizes)."""
     # Get nice display names for the axes
     axis_names = {
@@ -391,7 +676,19 @@ def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outl
                 mcap_str = f"{mcap_crores:.2f} Cr"
         else:
             mcap_str = "N/A"
-        hover_info = f"<b>{stock_name}</b><br>Company: {company_name}<br>Market Cap: ₹{mcap_str}<br>{x_title}: {row[x_col]*x_multiplier:.2f}<br>{y_title}: {row[y_col]*y_multiplier:.2f}"; hover_text.append(hover_info)
+        
+        # Add similarity score to hover if available
+        similarity_str = ""
+        if similarity_map is not None:
+            idx_normalized = ai_comps_normalize_symbol(idx)
+            idx_short = idx.replace('.NS', '').upper()
+            score = similarity_map.get(idx_normalized) or similarity_map.get(idx_short) or similarity_map.get(idx)
+            if score is not None:
+                similarity_str = f"<br>Similarity: {score:.1f}%"
+            else:
+                similarity_str = "<br>Similarity: N/A"
+        
+        hover_info = f"<b>{stock_name}</b><br>Company: {company_name}<br>Market Cap: ₹{mcap_str}<br>{x_title}: {row[x_col]*x_multiplier:.2f}<br>{y_title}: {row[y_col]*y_multiplier:.2f}{similarity_str}"; hover_text.append(hover_info)
     fig = go.Figure()
     # Robust marker sizes based on market cap (use log scale for better differentiation)
     if 'marketCap' in filtered_metrics.columns:
@@ -417,7 +714,24 @@ def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outl
         base_sizes = pd.Series([12]*len(filtered_metrics), index=filtered_metrics.index)
     # Replace any remaining invalid sizes
     base_sizes = base_sizes.fillna(12)
-    colors = ['red' if (highlight_stock and idx==highlight_stock) else 'steelblue' for idx in filtered_metrics.index]
+    
+    # Color logic with similarity highlighting
+    colors = []
+    for idx in filtered_metrics.index:
+        if highlight_stock and idx == highlight_stock:
+            colors.append('red')  # Highlighted stock is always red
+        elif similarity_map is not None and similarity_threshold is not None:
+            # Check similarity score for yellow highlighting
+            idx_normalized = ai_comps_normalize_symbol(idx)
+            idx_short = idx.replace('.NS', '').upper()
+            score = similarity_map.get(idx_normalized) or similarity_map.get(idx_short) or similarity_map.get(idx)
+            if score is not None and score >= similarity_threshold:
+                colors.append('yellow')  # Similar stocks are yellow
+            else:
+                colors.append('steelblue')  # Default color
+        else:
+            colors.append('steelblue')  # Default color when no similarity data
+    
     sizes = [base_sizes.loc[idx] for idx in filtered_metrics.index]  # No size multiplier for highlighted stock
     trace_cls = go.Scatter  # Force regular Scatter (avoid WebGL blank issue)
     fig.add_trace(trace_cls(
@@ -460,16 +774,38 @@ def create_plotly_scatter(metrics_df, industry_filter, x_col, y_col, remove_outl
     return fig, filtered_metrics
 
 
-def render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode=False, use_gl=True):
+def render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode=False, use_gl=True, similarity_threshold=None, similarity_map=None, ai_plot_mode="Highlight Mode"):
     """
     Render scatter charts using the existing plotting pipeline.
     This is a helper function to avoid code duplication across modes.
+    ai_plot_mode: "Highlight Mode" - all stocks plotted, similar ones yellow
+                  "Filter Mode" - only similar stocks plotted
     """
     num_charts = len(chart_configs)
     
     if filtered_df is None or len(filtered_df) == 0:
         st.warning(f"No stocks found for {title_prefix}.")
         return
+    
+    # Apply Filter Mode if enabled - filter to only stocks meeting similarity threshold
+    df_to_plot = filtered_df
+    if ai_plot_mode == "Filter Mode" and similarity_map and similarity_threshold is not None:
+        # Filter to only include stocks that meet the similarity threshold
+        filtered_indices = []
+        for idx in filtered_df.index:
+            idx_normalized = ai_comps_normalize_symbol(idx)
+            idx_short = idx.replace('.NS', '').upper()
+            score = similarity_map.get(idx_normalized) or similarity_map.get(idx_short) or similarity_map.get(idx)
+            # Include if score >= threshold OR if it's the highlighted stock
+            if (score is not None and score >= similarity_threshold) or (highlight_stock and idx == highlight_stock):
+                filtered_indices.append(idx)
+        
+        if filtered_indices:
+            df_to_plot = filtered_df.loc[filtered_indices]
+            st.info(f"🎯 **Filter Mode**: Showing {len(df_to_plot)} stocks with similarity ≥ {similarity_threshold}%")
+        else:
+            st.warning(f"No stocks meet the similarity threshold of {similarity_threshold}%. Try lowering the threshold.")
+            return
     
     # Layout based on number of charts
     if num_charts == 1:
@@ -489,7 +825,7 @@ def render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_sto
         y_col = cfg['y_col']
         chart_num = cfg['chart_num']
         
-        metrics_df, message = extract_metrics(filtered_df, x_col, y_col)
+        metrics_df, message = extract_metrics(df_to_plot, x_col, y_col)
         
         if metrics_df is None:
             with cols[i % len(cols)]:
@@ -499,7 +835,8 @@ def render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_sto
         fig, final_metrics = create_plotly_scatter(
             metrics_df, title_prefix, x_col, y_col,
             remove_outliers, highlight_stock, autoscale=True,
-            use_gl=use_gl, debug=debug_mode
+            use_gl=use_gl, debug=debug_mode,
+            similarity_threshold=similarity_threshold, similarity_map=similarity_map
         )
         
         if fig is None:
@@ -645,6 +982,66 @@ def main():
             else:
                 st.sidebar.error(f"Stock {selected_stock_clean} not found in data")
                 return
+        
+        # ==================== AI COMPS CONFIG (Stock Mode Only) ====================
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🤖 AI Comps Config")
+        
+        if not GENAI_AVAILABLE:
+            st.sidebar.error("❌ google-generativeai not installed")
+        else:
+            # Show current API keys status
+            num_keys = len(st.session_state.ai_comps_api_keys)
+            if num_keys > 0:
+                st.sidebar.success(f"✅ {num_keys} API key(s) configured")
+                current_key_idx = st.session_state.ai_comps_current_key_index % num_keys
+                st.sidebar.caption(f"Next key to use: Key {current_key_idx + 1}")
+            else:
+                st.sidebar.warning("⚠️ No API keys configured")
+                st.sidebar.caption("Add keys to DEFAULT_API_KEYS in code")
+            
+            # Option to add more keys at runtime
+            with st.sidebar.expander("➕ Add API Key"):
+                new_key = st.text_input("Gemini API Key:", type="password", key="sidebar_new_api_key", placeholder="Paste key here...")
+                if st.button("Add Key", key="sidebar_add_key_btn"):
+                    if new_key and new_key not in st.session_state.ai_comps_api_keys:
+                        st.session_state.ai_comps_api_keys.append(new_key)
+                        st.sidebar.success("✅ Key added!")
+                        st.rerun()
+                    elif new_key in st.session_state.ai_comps_api_keys:
+                        st.sidebar.warning("Key already exists")
+            
+            # Batch size config
+            ai_batch_size = st.sidebar.slider(
+                "Batch size:",
+                min_value=1,
+                max_value=10,
+                value=5,
+                help="Companies per API call",
+                key="sidebar_ai_batch"
+            )
+            
+            # Run Analysis button
+            if st.sidebar.button("🚀 Run AI Analysis", type="primary", key="sidebar_run_ai"):
+                if filtered_df is not None and len(filtered_df) > 0:
+                    if st.session_state.ai_comps_api_keys:
+                        target_stock_name = selected_stock_clean
+                        target_bd = df.loc[selected_stock, 'longName'] if selected_stock in df.index else title_prefix
+                        
+                        with st.spinner("Running AI analysis..."):
+                            results = ai_comps_run_analysis(
+                                filtered_df, 
+                                target_bd, 
+                                target_stock_name, 
+                                ai_batch_size
+                            )
+                            if results is not None:
+                                st.session_state.ai_comps_results_df = results
+                                st.rerun()
+                    else:
+                        st.sidebar.error("Add API keys first!")
+                else:
+                    st.sidebar.error("Select a stock first!")
     
     # ==================== SECTOR MODE ====================
     elif analysis_mode == "Sector Mode":
@@ -774,10 +1171,48 @@ def main():
             value=True,
             help="Remove extreme values for better visualization"
         )
+        
+        # ==================== AI COMPS SIMILARITY CONTROLS ====================
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🤖 AI Similarity Analysis")
+        
+        # Plot mode selector
+        ai_plot_mode = st.sidebar.radio(
+            "Plot Mode:",
+            ["Highlight Mode", "Filter Mode"],
+            index=0 if st.session_state.ai_comps_plot_mode == "Highlight Mode" else 1,
+            help="Highlight Mode: All stocks plotted, similar ones in yellow. Filter Mode: Only similar stocks plotted.",
+            key="ai_plot_mode_radio"
+        )
+        st.session_state.ai_comps_plot_mode = ai_plot_mode
+        
+        # Similarity threshold slider
+        similarity_threshold = st.sidebar.slider(
+            "Similarity threshold (%)",
+            min_value=0,
+            max_value=100,
+            value=st.session_state.ai_comps_similarity_threshold,
+            help="Stocks with relevance >= this value will be highlighted (Highlight Mode) or shown (Filter Mode)."
+        )
+        st.session_state.ai_comps_similarity_threshold = similarity_threshold
+        
+        # Get similarity map if available
+        similarity_map = ai_comps_get_similarity_map()
+        
+        # Show status
+        if similarity_map:
+            num_similar = sum(1 for s, score in similarity_map.items() if score >= similarity_threshold and s.endswith('.NS'))
+            st.sidebar.success(f"✅ AI data: {len(similarity_map)//2} stocks")
+            if ai_plot_mode == "Filter Mode":
+                st.sidebar.info(f"🎯 {num_similar} stocks ≥ {similarity_threshold}% threshold")
+        else:
+            st.sidebar.info("💡 Run AI comps to enable similarity highlighting")
     else:
         num_charts = 0
         chart_configs = []
         remove_outliers = True
+        similarity_threshold = None
+        similarity_map = None
     
     # # ==================== STATUS DISPLAY ====================
     # if filtered_df is not None and len(filtered_df) > 0:
@@ -796,7 +1231,7 @@ def main():
     if url_mode == 'scatter':
         # Direct scatter mode from URL
         if filtered_df is not None and len(filtered_df) > 0:
-            render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl)
+            render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl, similarity_threshold, similarity_map, st.session_state.ai_comps_plot_mode)
         else:
             st.warning("Please select a stock, sector, or index to view charts.")
     
@@ -849,11 +1284,11 @@ def main():
     
     else:
         # Default: show both tabs
-        charts_tab, concall_tab = st.tabs(["📊 Charts", "🗣️ Concall Summaries"])
+        charts_tab, concall_tab, ai_comps_tab = st.tabs(["📊 Charts", "🗣️ Concall Summaries", "🤖 AI Comps"])
         
         with charts_tab:
             if filtered_df is not None and len(filtered_df) > 0:
-                render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl)
+                render_charts(df, filtered_df, chart_configs, remove_outliers, highlight_stock, title_prefix, debug_mode, use_gl, similarity_threshold, similarity_map, st.session_state.ai_comps_plot_mode)
             else:
                 st.warning("Please select a stock, sector, or index to view charts.")
         
@@ -902,6 +1337,61 @@ def main():
                             else:
                                 cols_to_show = [symbol_col] + ([summary_col] if summary_col else [])
                                 st.dataframe(hits[cols_to_show])
+        
+        with ai_comps_tab:
+            st.subheader("🤖 AI Competitor Analysis Results")
+            
+            # Check mode - AI Comps only available in Stock Mode
+            if analysis_mode != "Stock Mode":
+                st.info("🔒 AI Competitor Analysis is only available in **Stock Mode**. Please switch to Stock Mode to use this feature.")
+            elif not GENAI_AVAILABLE:
+                st.error("❌ google-generativeai package not installed. Run: `pip install google-generativeai`")
+            elif st.session_state.ai_comps_results_df is None:
+                st.info("� No AI analysis results yet. Use the **AI Comps Config** section in the sidebar to run analysis.")
+                st.markdown("""
+                **How to use AI Comps:**
+                1. Select a stock in Stock Mode
+                2. Configure API keys in the sidebar (or add to `DEFAULT_API_KEYS` in code)
+                3. Click **Run AI Analysis** in the sidebar
+                4. Results will appear here with similarity highlighting on charts
+                """)
+            else:
+                # Display results
+                results_df = st.session_state.ai_comps_results_df
+                
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Analyzed", len(results_df))
+                col2.metric("High Similarity (≥70)", len(results_df[results_df['Relevance Score'] >= 70]))
+                col3.metric("Medium (50-69)", len(results_df[(results_df['Relevance Score'] >= 50) & (results_df['Relevance Score'] < 70)]))
+                col4.metric("Avg Score", f"{results_df['Relevance Score'].mean():.1f}")
+                
+                st.markdown("---")
+                
+                # Results table
+                st.dataframe(
+                    results_df[['Company Name', 'Relevance Score', 'Business Summary', 'Business Model', 'Relevance Reason']],
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Action buttons
+                col_dl, col_clear = st.columns(2)
+                
+                with col_dl:
+                    csv_data = results_df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Results CSV",
+                        csv_data,
+                        f"ai_comps_results_{title_prefix.replace(' ', '_')}.csv",
+                        "text/csv",
+                        key="ai_comps_download"
+                    )
+                
+                with col_clear:
+                    if st.button("🗑️ Clear Results", key="ai_comps_clear"):
+                        st.session_state.ai_comps_results_df = None
+                        st.rerun()
 
 
 if __name__ == "__main__":
